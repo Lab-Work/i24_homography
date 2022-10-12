@@ -779,11 +779,38 @@ class Curvilinear_Homography():
         med_tck,med_u = interpolate.splprep(med_data, s=0, per=False)
         
         # 10. Use the finite difference method to reparameterize this spline according to distance along it
+        span_dist = np.sqrt((med_spl_x[0] - med_spl_x[-1])**2 + (med_spl_y[0] - med_spl_y[-1])**2)
+        med_x_prime, med_y_prime = interpolate.splev(np.linspace(0, 1, int(span_dist*samples_per_foot)), med_tck)
         
-        # 11. Optionally, compute a median spline distance offset from mile markers
         
-        # 12. Optionally, recompute the same spline, this time accounting for the MM offset
-    
+        med_fd_dist = np.concatenate(  (np.array([0]),  ((med_x_prime[1:] - med_x_prime[:-1])**2 + (med_y_prime[1:] - med_y_prime[:-1])**2)**0.5),axis = 0) # by convention fd_dist[0] will be 0, so fd_dist[i] = sum(int_dist[0:i])
+        med_integral_dist = np.cumsum(med_fd_dist)
+        
+        # for each fit point, find closest point on spline, and assign it the corresponding integral distance
+        med_spl_u = []
+        for p_idx in range(len(med_spl_x)):
+            px = med_spl_x[p_idx]
+            py = med_spl_y[p_idx]
+            
+            dist = ((med_x_prime - px)**2 + (med_y_prime - py)**2)**0.5
+            min_dist,min_idx= np.min(dist),np.argmin(dist)
+            med_spl_u.append(med_integral_dist[min_idx])
+        
+        
+        final_tck, final_u = interpolate.splprep(ae_data.astype(float), s=0, u = ae_spl_u)
+        self.median_tck = final_tck
+        self.median_u = final_u
+        
+        
+        if use_MM_offset:
+            # 11. Optionally, compute a median spline distance offset from mile markers
+            self.MM_offset = self._fit_MM_offset()
+        
+            # 12. Optionally, recompute the same spline, this time accounting for the MM offset
+            ae_spl_u += self.MM_offset
+            final_tck, final_u = interpolate.splprep(ae_data.astype(float), s=0, u = ae_spl_u)
+            self.median_tck = final_tck
+            self.median_u = final_u
     
     
     
