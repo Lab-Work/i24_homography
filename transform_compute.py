@@ -1,24 +1,23 @@
 import cv2
-import time
+# import time
 import os
 import numpy as np
-import csv
-import string
-import re
-import copy
+# import csv
+# import string
+# import re
+# import copy
 import _pickle as pickle
 import torch
-import PyNvCodec as nvc
-import PytorchNvCodec as pnvc
-import torchvision.transforms.functional as F
-from scipy.spatial import ConvexHull
-import itertools
-import sys
+# import PyNvCodec as nvc
+# import PytorchNvCodec as pnvc
+# import torchvision.transforms.functional as F
+# from scipy.spatial import ConvexHull
+# import itertools
+# import sys
 
 import pandas as pd
 from scipy import interpolate
 
-from homography import Homography
 
 
 def line_to_point(line,point):
