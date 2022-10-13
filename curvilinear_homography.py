@@ -120,6 +120,7 @@ class Curvilinear_Homography():
             self._fit_spline(space_dir)
             self._get_extents()    
         
+        self.spline_cache = None
         
         # object class info doesn't really belong in homography but it's unclear
         # where else it should go, and this avoids having to pass it around 
@@ -619,7 +620,6 @@ class Curvilinear_Homography():
         
         print("Best Error: {}".format(best_error))
         
-        
     def _fit_spline(self,space_dir,use_MM_offset = False):
         """
         Spline fitting is done by:
@@ -812,13 +812,23 @@ class Curvilinear_Homography():
             self.median_tck = final_tck
             self.median_u = final_u
     
+    def _cache_spline_points(self,granularity = 0.1):
+        """
+        Caches u,x, and y for a grid with specified granularity
+        granularity - float
+        RETURN: None, but sets self.spline_cache as [n,3] tensor of u,x,y
+        """
+        umin = min(self.median_u)
+        umax = max(self.median_u)
+        count = int((umax-umin)*1/granularity)
+        u_prime = np.linspace(umin,umax,count)
+        med_x_prime, med_y_prime = interpolate.splev(u_prime, self.median_tck)
+        
+        self.spline_cache = torch.stack([torch.from_numpy(arr) for arr in [u_prime,med_x_prime,med_y_prime]])
     
     
     def _fit_MM_offset(self):
-        pass
-    
-    def _cache_spline_points(self,granularity = 0.1):
-        pass
+        return 0
     
     def _get_extents(self):
         pass
@@ -829,28 +839,297 @@ class Curvilinear_Homography():
 
     
     #%% Conversion Functions
+    @safe_name
+    def _im_sp(self,points,heights = None, name = None, direction = "EB"):
+        """
+        Converts points by means of perspective transform from image to space
+        points    - [d,m,2] array of points in image
+        name      - list of correspondence key names
+        direction - "EB" or "WB" - speecifies which correspondence to use
+        RETURN:     [d,m,3] array of points in space 
+        """
+        if name is None:
+            name = list(self.correspondence.keys())[0]
+        
+        
+        d = points.shape[0]
+        
+        # convert points into size [dm,3]
+        points = points.view(-1,2).double()
+        points = torch.cat((points,torch.ones([points.shape[0],1],device=points.device).double()),1) # add 3rd row
+        
+        if heights is not None:
+            
+            if type(name) == list:
+                H = torch.from_numpy(np.stack([self.correspondence[sub_n + "_{}".format(direction)]["H"].transpose(1,0) for sub_n in name])) # note that must do transpose(1,0) because this is a numpy operation, not a torch operation ...
+                H = H.unsqueeze(1).repeat(1,8,1,1).view(-1,3,3).to(points.device)
+                points = points.unsqueeze(1)
+                new_pts = torch.bmm(points,H)
+                new_pts = new_pts.squeeze(1)
+            else:
+                H = torch.from_numpy(self.correspondence[name]["H"]).transpose(0,1).to(points.device)
+                new_pts = torch.matmul(points,H)
+            
+            # divide each point 0th and 1st column by the 2nd column
+            new_pts[:,0] = new_pts[:,0] / new_pts[:,2]
+            new_pts[:,1] = new_pts[:,1] / new_pts[:,2]
+            
+            # drop scale factor column
+            new_pts = new_pts[:,:2] 
+            
+            # reshape to [d,m,2]
+            new_pts = new_pts.view(d,-1,2)
+            
+            # add third column for height
+            new_pts = torch.cat((new_pts,torch.zeros([d,new_pts.shape[1],1],device = points.device).double()),2)
+            
+            new_pts[:,[4,5,6,7],2] = heights.unsqueeze(1).repeat(1,4).double()
+            
+        else:
+            print("No heights were input")
+            return
+        
+        return new_pts
     
     @safe_name
-    def im_to_space(self,heights = None):
-        pass
+    def _sp_im(self,points, name = None, direction = "EB"):
+       """
+       Projects 3D space points into image/correspondence using P:
+           new_pts = P x points T  ---> [dm,3] T = [3,4] x [4,dm]
+       performed by flattening batch dimension d and object point dimension m together
+       
+       name      - list of correspondence key names
+       direction - "EB" or "WB" - speecifies which correspondence to use
+       points    - [d,m,3] array of points in 3-space
+       RETURN:     [d,m,2] array of points in 2-space
+       """
+       if name is None:
+           name = list(self.correspondence.keys())[0]
+       
+       d = points.shape[0]
+       
+       # convert points into size [dm,4]
+       points = points.view(-1,3)
+       points = torch.cat((points.double(),torch.ones([points.shape[0],1],device = points.device).double()),1) # add 4th row
+       
+       
+       # project into [dm,3]
+       if type(name) == list:
+               P = torch.from_numpy(np.stack([self.correspondence[sub_n + "_{}".format(direction)]["P"] for sub_n in name]))
+               P = P.unsqueeze(1).repeat(1,8,1,1).reshape(-1,3,4).to(points.device)
+               points = points.unsqueeze(1).transpose(1,2)
+               new_pts = torch.bmm(P,points).squeeze(2)
+       else:
+           points = torch.transpose(points,0,1).double()
+           P = torch.from_numpy(self.correspondence[name]["P"]).double().to(points.device)
+           new_pts = torch.matmul(P,points).transpose(0,1)
+       
+       # divide each point 0th and 1st column by the 2nd column
+       new_pts[:,0] = new_pts[:,0] / new_pts[:,2]
+       new_pts[:,1] = new_pts[:,1] / new_pts[:,2]
+       
+       # drop scale factor column
+       new_pts = new_pts[:,:2] 
+       
+       # reshape to [d,m,2]
+       new_pts = new_pts.view(d,-1,2)
+       return new_pts 
     
-    def space_to_state(self):
-        pass
+    def im_to_space(self,points, name = None,heights = None):
+        """
+        Wrapper function on _im_sp necessary because it is not immediately evident 
+        from points in image whether the EB or WB corespondence should be used
+        
+        points    - [d,m,2] array of points in image
+        name      - list of correspondence key names
+        heights   - [d] tensor of object heights
+        RETURN:     [d,m,3] array of points in space 
+        """
+        boxes  = self._im_sp(points,name = name, heights = heights,direction = "EB")
+        boxes2 = self._im_sp(points,name = name, heights = heights,direction = "EB")
+
+        # get indices where to use boxes1 and where to use boxes2 based on centerline y
+        
+        # TODO - change this to use get_direction
+        ind = torch.where(boxes[:,0,1] > 60)[0] 
+        boxes[ind,:,:] = boxes2[ind,:,:]
+        return boxes
     
-    def state_to_space(self):
-        pass
+    def space_to_im(self, points, name = None):
+        """
+        Wrapper function on _sp_im necessary because it is not immediately evident 
+        from points in image whether the EB or WB corespondence should be used
+        
+        name    - list of correspondence key names
+        points  - [d,m,3] array of points in 3-space
+        RETURN:   [d,m,2] array of points in 2-space
+        """
+        
+        boxes  = self._sp_im(points,name = name, direction = "EB")
+        boxes2 = self._sp_im(points,name = name, direction = "WB")
+        
+        # get indices where to use boxes1 and where to use boxes2 based on centerline y
+        # TODO - modify to use get_direction 
+        ind = torch.where(points[:,0,1] > 60)[0]
+        boxes[ind,:] = boxes2[ind,:]        
+        return boxes
+        
+    def im_to_state(self,points, name = None, heights = None):
+        """
+        Converts image boxes to roadway coordinate boxes
+        points    - [d,m,2] array of points in image
+        name      - list of correspondence key names
+        heights   - [d] tensor of object heights
+        RETURN:     [d,s] array of boxes in state space where s is state size (probably 6)
+        """
+        space_pts = self.im_to_space(points,name = name, heights = heights)
+        return self.space_to_state(space_pts)
     
-    @safe_name
-    def space_to_im(self):
-        pass
+    def state_to_im(self,points,name = None):
+        """
+        Converts roadway coordinate boxes to image space boxes
+        points    - [d,s] array of boxes in state space where s is state size (probably 6)
+        name      - list of correspondence key names
+        RETURN:   - [d,m,2] array of points in image
+        """
+        space_pts = self.state_to_space(points)
+        return self.space_to_im(space_pts,name = name)
     
-    @safe_name
-    def im_to_state(self):
-        pass
+    def space_to_state(self,points):
+        """        
+        Conversion from state plane coordinates to roadway coordinates via the following steps:
+            1. If spline points aren't yet cached, cache them
+            2. Convert space points to L,W,H,x_back,y_center
+            3. Search coarse grid for best fit point for each point
+            4. Search fine grid for best offset relative to each coarse point
+            5. Final state space obtained
+            
+        points - [d,m,3] 
+        RETURN:  [d,s] array of boxes in state space where s is state size (probably 6)
+        """
+        
+        # 1. If spline points aren't yet cached, cache them
+        if self.spline_cache is None:
+            self.cache_spline_points()
+        
+        # 2. Convert space points to L,W,H,x_back,y_center
+        d = points.shape[0]
+        new_pts = torch.zeros([d,6],device = points.device)
+        
+        # rear center bottom of vehicle is (x,y)
+        
+        # x is computed as average of two bottom rear points
+        new_pts[:,0] = (points[:,2,0] + points[:,3,0]) / 2.0
+        
+        # y is computed as average 4 bottom point y values
+        new_pts[:,1] = (points[:,0,1] + points[:,1,1] +points[:,2,1] + points[:,3,1]) / 4.0
+        
+        # l is computed as avg length between bottom front and bottom rear
+        new_pts[:,2] = torch.abs ( ((points[:,0,0] + points[:,1,0]) - (points[:,2,0] + points[:,3,0]))/2.0 )
+        
+        # w is computed as avg length between botom left and bottom right
+        new_pts[:,3] = torch.abs(  ((points[:,0,1] + points[:,2,1]) - (points[:,1,1] + points[:,3,1]))/2.0)
+
+        # h is computed as avg length between all top and all bottom points
+        new_pts[:,4] = torch.mean(torch.abs( (points[:,0:4,2] - points[:,4:8,2])),dim = 1)
+        
+        # direction is +1 if vehicle is traveling along direction of increasing x, otherwise -1
+        new_pts[:,5] = torch.sign( ((points[:,0,0] + points[:,1,0]) - (points[:,2,0] + points[:,3,0]))/2.0 ) 
+        
+        
+        # TODO - for now just do single pass, and see whether accuracy and speed are good enough
+        # 3. Search coarse grid for best fit point for each point
+        # 4. Search fine grid for best offset relative to each coarse point
+
+        # compute dist [d,n_grid_points]
+        n_grid_points = len(self.spline_cache[0])
+        x_grid = self.spline_cache[1].unsqueeze(0).expand(d,n_grid_points)        
+        y_grid = self.spline_cache[2].unsqueeze(0).expand(d,n_grid_points)
+        x_pts  = new_pts[:,0].unsqueeze(1).expand(d,n_grid_points)
+        y_pts  = new_pts[:,1].unsqueeze(1).expand(d,n_grid_points)
+        
+        dist = torch.sqrt((x_grid - x_pts)**2 + (y_grid - y_pts)**2)
+        
+        # get min_idx for each object
+        min_idx = torch.argmin(dist,dim = 0)
+        it = [i for i in range(d)]
+        min_dist = dist[it,min_idx]
+        min_u = self.spline_cache[0][min_idx]
+        
+        new_pts[:,0] = min_u
+        new_pts[:,1] = min_dist
+        
+        # if direction is -1 (WB), y coordinate is negative
+        new_pts[:,1] *= new_pts[:,5]
+
+        # 5. Final state space obtained
+        return new_pts
+        
     
-    @safe_name
-    def state_to_im(self):
-        pass
+    def state_to_space(self,points):
+        """
+        Conversion from state plane coordinates to roadway coordinates via the following steps:
+            1. get x-y coordinate of closest point along spline (i.e. v = 0)
+            2. get derivative of spline at that point
+            3. get perpendicular direction at that point
+            4. Shift x-y point in that direction
+            5. Offset base points in each constituent direction
+            6. Add top points
+            
+        Note that by convention 3D box point ordering  = fbr,fbl,bbr,bbl,ftr,ftl,fbr,fbl and roadway coordinates reference back center of vehicle
+        """
+        
+        # 1. get x-y coordinate of closest point along spline (i.e. v = 0)
+        d = points.shape[0]
+        closest_median_point_x, closest_median_point_y = self.splev(points[:,0],self.median_tck)
+        
+        # 2. get derivative of spline at that point
+        l_direction_x,l_direction_y          = self.splev(points[:,0],self.median_tck, der = 1)
+
+        # 3. get perpendicular direction at that point
+        w_direction_x,w_direction_y          = -1/l_direction_x  , -1/l_direction_y
+        
+        # 4. Shift x-y point in that direction
+        hyp_l = torch.sqrt(l_direction_x**2 + l_direction_y **2)
+        hyp_w = torch.sqrt(w_direction_x**2 + w_direction_y **2)
+        
+        # shift associated with the length of the vehicle, in x-y space
+        x_shift_l    = torch.sqrt(l_direction_x**2 / (hyp_l**2)) * points[:,2]
+        y_shift_l    = torch.sqrt(l_direction_y**2 / (hyp_l**2)) * points[:,2] 
+        
+        # shift associated with the width of the vehicle, in x-y space
+        x_shift_w    = torch.sqrt(w_direction_x**2 / (hyp_w**2)) * (points[:,3]/2.0)
+        y_shift_w    = torch.sqrt(w_direction_y**2 / (hyp_w**2)) * (points[:,3]/2.0)
+        
+        # shift associated with the perp distance of the object from the median, in x-y space
+        x_shift_perp = torch.sqrt(w_direction_x**2 / (hyp_w**2)) * points[:,1]
+        y_shift_perp = torch.sqrt(w_direction_y**2 / (hyp_w**2)) * points[:,1]
+        
+        # 5. Offset base points in each constituent direction
+        
+        new_pts = torch.zeros[d,4,3]
+        
+        # shift everything to median point
+        new_pts[:,:,0] = closest_median_point_x + x_shift_perp
+        new_pts[:,:,1] = closest_median_point_y + y_shift_perp
+        
+        # shift front points
+        new_pts[:,[0,1],0] += x_shift_l
+        new_pts[:,[0,1],1] += y_shift_l
+        
+        new_pts[:,[0,2],0] += x_shift_w
+        new_pts[:,[0,2],1] += y_shift_w
+        new_pts[:,[1,3],0] -= x_shift_w
+        new_pts[:,[1,3],1] -= y_shift_w
+    
+        #6. Add top points
+        top_pts = new_pts.clone()
+        top_pts[:,:,2] += points[:,4]
+        new_pts = torch.cat((new_pts,top_pts),dim = 1)
+        
+        return new_pts
+    
+    
     
     def get_direction(self):
         pass
