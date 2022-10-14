@@ -104,7 +104,7 @@ class Curvilinear_Homography():
         if save_file is not None:
             with open(save_file,"rb") as f:
                 # everything in correspondence is pickleable without object definitions to allow compatibility after class definitions change
-                self.correspondence,spline_params = pickle.load(f)
+                self.correspondence,self.median_tck,self.median_u = pickle.load(f)
             
             # reload  parameters of curvilinear axis spline
             # rather than the spline itself for better pickle reloading compatibility
@@ -114,13 +114,16 @@ class Curvilinear_Homography():
             raise IOError("Either save_file or space_dir and im_dir must not be None")
         
         else:
-            #self.generate(space_dir,im_dir)
+            self.generate(space_dir,im_dir)
             
             #  fit the axis spline once and collect extents
             self._fit_spline(space_dir)
-            self._get_extents()    
+            #self._get_extents()    
         
-        self.spline_cache = None
+        print("caching spline points")
+        self._cache_spline_points()
+        
+        self.save("new_hg_save.cpkl")
         
         # object class info doesn't really belong in homography but it's unclear
         # where else it should go, and this avoids having to pass it around 
@@ -158,13 +161,18 @@ class Curvilinear_Homography():
                     }
         
         
-    
-    def generate(self,space_dir,
+    def save(self,save_file):
+        with open(save_file,"wb") as f:
+            pickle.dump([self.correspondence,self.median_tck,self.median_u],f)
+        
+        
+    def generate(self,
+                 space_dir,
                  im_dir,
                  downsample     = 1,
                  max_proj_error = 0.25,
-                 scale_factor   = 0.5,
-                 ADD_PROJ       = True):
+                 scale_factor   = 3,
+                 ADD_PROJ       = False):
         """
         Loads all available camera homographies from the specified paths.
         after running, self.correspondence is a dict with one key for each <camera>_<direction>
@@ -178,13 +186,13 @@ class Curvilinear_Homography():
         ADD_PROJ       - bool - if true, compute points along yellow line to use in homography
         """
         
-        
+        ae_x = []
+        ae_y = []
+        ae_id = []
         for direction in ["EB","WB"]:
             ### State space, do once
             
-            ae_x = []
-            ae_y = []
-            ae_id = []
+
             
             for file in os.listdir(space_dir):
                 if direction.lower() not in file:
@@ -331,7 +339,7 @@ class Curvilinear_Homography():
     
     
         # get all cameras
-        cam_data_paths = glob.glob(os.path.join(space_dir,"*.cpkl"))
+        cam_data_paths = glob.glob(os.path.join(im_dir,"*.cpkl"))
         
         for cam_data_path in cam_data_paths:
             # specify path to camera imagery file
@@ -342,174 +350,184 @@ class Curvilinear_Homography():
             with open(cam_data_path, "rb") as f:
                 im_data = pickle.load(f)
                 
-            
-            # get all non-curve matching points
-            point_data = im_data[direction]["points"]
-            filtered = filter(lambda x: x[2].split("_")[1] not in ["yeli","yelo","whli","whlo"],point_data)
-            im_x  = []
-            im_y  = []
-            im_id = []
-            for item in filtered:
-                im_x.append(item[0])
-                im_y.append(item[1])
-                im_id.append(item[2])
-            
-            if len(im_x) == 0:
-                continue
-            
-            if ADD_PROJ:
-            
-                # compute the yellow line spline in image coordinates
-                curve_data = im_data[direction]["curves"]
-                filtered = filter(lambda x: "yeli" in x[2], curve_data)
-                x = []
-                y = []
+            for direction in ["EB","WB"]:
+                # get all non-curve matching points
+                point_data = im_data[direction]["points"]
+                filtered = filter(lambda x: x[2].split("_")[1] not in ["yeli","yelo","whli","whlo"],point_data)
+                im_x  = []
+                im_y  = []
+                im_id = []
                 for item in filtered:
-                    x.append(item[0])
-                    y.append(item[1])
-                data = np.stack([np.array(x),np.array(y)])
-                data = data[:,np.argsort(data[0,:])]
+                    im_x.append(item[0])
+                    im_y.append(item[1])
+                    im_id.append(item[2])
                 
-                tck, u = interpolate.splprep(data, s=0, per=False)
-                x_prime, y_prime = interpolate.splev(np.linspace(0, 1, 4000), tck)
+                if len(im_x) == 0:
+                    continue
                 
-                if False:
-                    im = cv2.imread(cam_im_path)
-                    for i in range(len(x_prime)):
-                        cv2.circle(im,(int(x_prime[i]),int(y_prime[i])), 2, (255,0,0,),-1)
+                if ADD_PROJ:
+                
+                    # compute the yellow line spline in image coordinates
+                    curve_data = im_data[direction]["curves"]
+                    filtered = filter(lambda x: "yeli" in x[2], curve_data)
+                    x = []
+                    y = []
+                    for item in filtered:
+                        x.append(item[0])
+                        y.append(item[1])
+                    data = np.stack([np.array(x),np.array(y)])
+                    data = data[:,np.argsort(data[0,:])]
+                    
+                    tck, u = interpolate.splprep(data, s=0, per=False)
+                    x_prime, y_prime = interpolate.splev(np.linspace(0, 1, 4000), tck)
+                    
+                    if False:
+                        im = cv2.imread(cam_im_path)
+                        for i in range(len(x_prime)):
+                            cv2.circle(im,(int(x_prime[i]),int(y_prime[i])), 2, (255,0,0,),-1)
+                            
+                        cv2.imshow("frame",im)
+                        cv2.waitKey(0)
+                        cv2.destroyAllWindows()
                         
-                    cv2.imshow("frame",im)
-                    cv2.waitKey(0)
-                    cv2.destroyAllWindows()
-                    
-                # find all d2 and d3 points
-            
-                # find the intersection of each d2d3 line and the yellow line spline for d2-d3 pairs in image
-                d2 = {}
-                d3 = {}
-                for i in range(len(im_x)):
-                    if "d2" in im_id[i]:
-                        if im_id[i].split("_")[-1] in ["a","d"]:
-                            num = im_id[i].split("_")[-2]
-                            if num not in d2.keys():
-                                d2[num] = [(im_x[i],im_y[i])]
-                            else:
-                                d2[num].append((im_x[i],im_y[i]))
-                    elif "d3" in im_id[i]:
-                        if im_id[i].split("_")[-1] in ["a","d"]:
-                            num = im_id[i].split("_")[-2]
-                            if num not in d3.keys():
-                                d3[num] = [(im_x[i],im_y[i])]
-                            else:
-                                d3[num].append((im_x[i],im_y[i]))
-                    
-            
-                # stack d2 and d3 into arrays            
-                d2_ids = []
-                d2_values = []
-                for key in d2.keys():
-                    d2[key] = [(d2[key][0][0] + d2[key][1][0])/2.0  , (d2[key][0][1] + d2[key][1][1])/2.0 ] 
+                    # find all d2 and d3 points
                 
-                d3_ids = []
-                d3_values = []
-                for key in d3.keys():
-                    d3[key] = [(d3[key][0][0] + d3[key][1][0])/2.0  , (d3[key][0][1] + d3[key][1][1])/2.0 ] 
+                    # find the intersection of each d2d3 line and the yellow line spline for d2-d3 pairs in image
+                    d2 = {}
+                    d3 = {}
+                    for i in range(len(im_x)):
+                        if "d2" in im_id[i]:
+                            if im_id[i].split("_")[-1] in ["a","d"]:
+                                num = im_id[i].split("_")[-2]
+                                if num not in d2.keys():
+                                    d2[num] = [(im_x[i],im_y[i])]
+                                else:
+                                    d2[num].append((im_x[i],im_y[i]))
+                        elif "d3" in im_id[i]:
+                            if im_id[i].split("_")[-1] in ["a","d"]:
+                                num = im_id[i].split("_")[-2]
+                                if num not in d3.keys():
+                                    d3[num] = [(im_x[i],im_y[i])]
+                                else:
+                                    d3[num].append((im_x[i],im_y[i]))
+                        
                 
-                additional_im_points = []
-                for proj_point in additional_points:
+                    # stack d2 and d3 into arrays            
+                    d2_ids = []
+                    d2_values = []
+                    for key in d2.keys():
+                        d2[key] = [(d2[key][0][0] + d2[key][1][0])/2.0  , (d2[key][0][1] + d2[key][1][1])/2.0 ] 
                     
+                    d3_ids = []
+                    d3_values = []
+                    for key in d3.keys():
+                        d3[key] = [(d3[key][0][0] + d3[key][1][0])/2.0  , (d3[key][0][1] + d3[key][1][1])/2.0 ] 
                     
-                    d3_id = proj_point[2].split("_")[0]
-                    d2_id = proj_point[2].split("_")[1]
-                    
-                    if d3_id not in d3.keys() or d2_id not in d2.keys():
-                        continue
-                    
-                    im_line = [d3[d3_id][0], d3[d3_id][1], d2[d2_id][0], d2[d2_id][1]]
-                    
-                    min_dist = np.inf
-                    min_point = None
-                    for i in range(len(x_prime)):
-                        point = [x_prime[i],y_prime[i]]
-            
-                        dist = line_to_point(im_line, point)
-                        if dist < min_dist:
-                            min_dist = dist
-                            min_point = point
-                    if min_dist > 2:
-                        print("Issue")
-                    else:
-                        name = proj_point[2]
-                        min_point.append(name)
-                        additional_im_points.append(min_point)
+                    additional_im_points = []
+                    for proj_point in additional_points:
                         
-                for point in additional_im_points:
-                    im_x.append(point[0])
-                    im_y.append(point[1])
-                    im_id.append(point[2])
-                    
-            ### Joint
-            
-            # assemble ordered list of all points visible in both image and space
-            
-            include_im_x  = []
-            include_im_y  = []
-            include_im_id = []
-            
-            include_ae_x  = []
-            include_ae_y  = []
-            include_ae_id = []
-            
-            for i in range(len(ae_id)):
-                for j in range(len(im_id)):
-                    
-                    if ae_id[i] == im_id[j]:
-                        include_im_x.append(  im_x[j])
-                        include_im_y.append(  im_y[j])
-                        include_im_id.append(im_id[j])
                         
-                        include_ae_x.append(  ae_x[i])
-                        include_ae_y.append(  ae_y[i])
-                        include_ae_id.append(ae_id[i])
-            
-            
-            
-            # compute homography
-            vp = im_data[direction]["z_vp"]
-            corr_pts = np.stack([np.array(include_im_x),np.array(include_im_y)]).transpose(1,0)
-            space_pts = np.stack([np.array(include_ae_x),np.array(include_ae_y)]).transpose(1,0)
-            
-            
-            cor = {}
-            #cor["vps"] = vp
-            cor["corr_pts"] = corr_pts
-            cor["space_pts"] = space_pts
-            
-            cor["H"],_     = cv2.findHomography(corr_pts,space_pts)
-            cor["H_inv"],_ = cv2.findHomography(space_pts,corr_pts)
-            
-            
-            # P is a [3,4] matrix 
-            #  column 0 - vanishing point for space x-axis (axis 0) in image coordinates (im_x,im_y,im_scale_factor)
-            #  column 1 - vanishing point for space y-axis (axis 1) in image coordinates (im_x,im_y,im_scale_factor)
-            #  column 2 - vanishing point for space z-axis (axis 2) in image coordinates (im_x,im_y,im_scale_factor)
-            #  column 3 - space origin in image coordinates (im_x,im_y,scale_factor)
-            #  columns 0,1 and 3 are identical to the columns of H, 
-            #  We simply insert the z-axis column (im_x,im_y,1) as the new column 2
-            
-            P = np.zeros([3,4])
-            P[:,0] = cor["H_inv"][:,0]
-            P[:,1] = cor["H_inv"][:,1]
-            P[:,3] = cor["H_inv"][:,2] 
-            P[:,2] = np.array([vp[0],vp[1],1])  * 10e-09
-            cor["P"] = P
+                        d3_id = proj_point[2].split("_")[0]
+                        d2_id = proj_point[2].split("_")[1]
+                        
+                        if d3_id not in d3.keys() or d2_id not in d2.keys():
+                            continue
+                        
+                        im_line = [d3[d3_id][0], d3[d3_id][1], d2[d2_id][0], d2[d2_id][1]]
+                        
+                        min_dist = np.inf
+                        min_point = None
+                        for i in range(len(x_prime)):
+                            point = [x_prime[i],y_prime[i]]
+                
+                            dist = line_to_point(im_line, point)
+                            if dist < min_dist:
+                                min_dist = dist
+                                min_point = point
+                        if min_dist > 2:
+                            print("Issue")
+                        else:
+                            name = proj_point[2]
+                            min_point.append(name)
+                            additional_im_points.append(min_point)
+                            
+                    for point in additional_im_points:
+                        im_x.append(point[0])
+                        im_y.append(point[1])
+                        im_id.append(point[2])
+                        
+                ### Joint
+                
+                # assemble ordered list of all points visible in both image and space
+                
+                include_im_x  = []
+                include_im_y  = []
+                include_im_id = []
+                
+                include_ae_x  = []
+                include_ae_y  = []
+                include_ae_id = []
+                
+                for i in range(len(ae_id)):
+                    for j in range(len(im_id)):
+                        
+                        if ae_id[i] == im_id[j]:
+                            include_im_x.append(  im_x[j])
+                            include_im_y.append(  im_y[j])
+                            include_im_id.append(im_id[j])
+                            
+                            include_ae_x.append(  ae_x[i])
+                            include_ae_y.append(  ae_y[i])
+                            include_ae_id.append(ae_id[i])
+                
+                
+                
+                # compute homography
+                vp = im_data[direction]["z_vp"]
+                corr_pts = np.stack([np.array(include_im_x),np.array(include_im_y)]).transpose(1,0)
+                space_pts = np.stack([np.array(include_ae_x),np.array(include_ae_y)]).transpose(1,0)
+                
+                if len(corr_pts) < 4 or len(space_pts) < 4:
+                    continue
+                
+                cor = {}
+                #cor["vps"] = vp
+                cor["corr_pts"] = corr_pts
+                cor["space_pts"] = space_pts
+                
+                cor["H"],_     = cv2.findHomography(corr_pts,space_pts)
+                cor["H_inv"],_ = cv2.findHomography(space_pts,corr_pts)
+                
+                
+                # P is a [3,4] matrix 
+                #  column 0 - vanishing point for space x-axis (axis 0) in image coordinates (im_x,im_y,im_scale_factor)
+                #  column 1 - vanishing point for space y-axis (axis 1) in image coordinates (im_x,im_y,im_scale_factor)
+                #  column 2 - vanishing point for space z-axis (axis 2) in image coordinates (im_x,im_y,im_scale_factor)
+                #  column 3 - space origin in image coordinates (im_x,im_y,scale_factor)
+                #  columns 0,1 and 3 are identical to the columns of H, 
+                #  We simply insert the z-axis column (im_x,im_y,1) as the new column 2
+                
+                P = np.zeros([3,4])
+                P[:,0] = cor["H_inv"][:,0]
+                P[:,1] = cor["H_inv"][:,1]
+                P[:,3] = cor["H_inv"][:,2] 
+                P[:,2] = np.array([vp[0],vp[1],1])  * 10e-09
+                cor["P"] = P
+        
+                self._fit_z_vp(cor,im_data,direction)
+                
+                cor["state_plane_pts"] = [include_ae_x,include_ae_y,include_ae_id]
+                cor_name = "{}_{}".format(camera,direction)
+                self.correspondence[cor_name] = cor
+        
+            # use other side if no homography defined
+            if "{}_{}".format(camera,"EB") not in self.correspondence.keys():
+                if "{}_{}".format(camera,"WB") in self.correspondence.keys():
+                    self.correspondence["{}_{}".format(camera,"EB")] = self.correspondence["{}_{}".format(camera,"WB")]
+            if "{}_{}".format(camera,"WB") not in self.correspondence.keys():
+                if "{}_{}".format(camera,"EB") in self.correspondence.keys():
+                    self.correspondence["{}_{}".format(camera,"WB")] = self.correspondence["{}_{}".format(camera,"EB")]
     
-            self._fit_z_vp(cor,im_data,direction)
-            
-            cor["state_plane_pts"] = [include_ae_x,include_ae_y,include_ae_id]
-            cor_name = "{}_{}".format(camera,direction)
-            self.correspondence[cor_name] = cor
-  
     def _fit_z_vp(self,cor,im_data,direction):
         P_orig = cor["P"].copy()
         
@@ -830,30 +848,35 @@ class Curvilinear_Homography():
     def _fit_MM_offset(self):
         return 0
     
-    def _get_extents(self):
+    def _generate_extents_file(self):
         pass
     
-    def generate_mask_images(self):
+    def _generate_mask_images(self):
         pass
     
 
     
     #%% Conversion Functions
     @safe_name
-    def _im_sp(self,points,heights = None, name = None, direction = "EB"):
+    def _im_sp(self,points,heights = None, name = None, direction = "EB",refine_heights = False):
         """
         Converts points by means of perspective transform from image to space
         points    - [d,m,2] array of points in image
         name      - list of correspondence key names
-        direction - "EB" or "WB" - speecifies which correspondence to use
+        heights   - [d] tensor of object (guessed) heights or 0
+        direction - "EB" or "WB" - specifies which correspondence to use
+        refine_heights - bool - if True, points are reprojected back into image and used to rescale the heights
         RETURN:     [d,m,3] array of points in space 
         """
         if name is None:
             name = list(self.correspondence.keys())[0]
         
-        
+        if type(name) == list and len(name[0].split("_")) == 1:
+            temp_name = [sub_n+ "_WB" for sub_n in name]
+            name = temp_name
+            
         d = points.shape[0]
-        
+        n_pts = points.shape[1]
         # convert points into size [dm,3]
         points = points.view(-1,2).double()
         points = torch.cat((points,torch.ones([points.shape[0],1],device=points.device).double()),1) # add 3rd row
@@ -861,8 +884,8 @@ class Curvilinear_Homography():
         if heights is not None:
             
             if type(name) == list:
-                H = torch.from_numpy(np.stack([self.correspondence[sub_n + "_{}".format(direction)]["H"].transpose(1,0) for sub_n in name])) # note that must do transpose(1,0) because this is a numpy operation, not a torch operation ...
-                H = H.unsqueeze(1).repeat(1,8,1,1).view(-1,3,3).to(points.device)
+                H = torch.from_numpy(np.stack([self.correspondence[sub_n]["H"].transpose(1,0) for sub_n in name])) # note that must do transpose(1,0) because this is a numpy operation, not a torch operation ...
+                H = H.unsqueeze(1).repeat(1,n_pts,1,1).view(-1,3,3).to(points.device)
                 points = points.unsqueeze(1)
                 new_pts = torch.bmm(points,H)
                 new_pts = new_pts.squeeze(1)
@@ -883,12 +906,22 @@ class Curvilinear_Homography():
             # add third column for height
             new_pts = torch.cat((new_pts,torch.zeros([d,new_pts.shape[1],1],device = points.device).double()),2)
             
-            new_pts[:,[4,5,6,7],2] = heights.unsqueeze(1).repeat(1,4).double()
+            # overwrite last_4 points with first 4 (i.e. top points are gibberish and not meaningful)
+            if n_pts == 8:
+                new_pts[:,4:,:] = new_pts[:,:4,:]
+            
+                if heights != 0: 
+                    new_pts[:,[4,5,6,7],2] = heights.unsqueeze(1).repeat(1,4).double()
             
         else:
             print("No heights were input")
             return
         
+        if refine_heights:
+            template_boxes = self.space_to_im(new_pts,name)
+            heights_new = self.height_from_template(template_boxes, heights, points)
+            new_pts[:,[4,5,6,7],2] = heights_new.unsqueeze(1).repeat(1,4).double()
+            
         return new_pts
     
     @safe_name
@@ -907,7 +940,13 @@ class Curvilinear_Homography():
            name = list(self.correspondence.keys())[0]
        
        d = points.shape[0]
-       
+       n_pts = points.shape[1]
+       # get directions and append to names
+
+       if type(name) == list and len(name[0].split("_")) == 1:
+           name = self.get_direction(points,name)[0]
+
+           
        # convert points into size [dm,4]
        points = points.view(-1,3)
        points = torch.cat((points.double(),torch.ones([points.shape[0],1],device = points.device).double()),1) # add 4th row
@@ -915,8 +954,8 @@ class Curvilinear_Homography():
        
        # project into [dm,3]
        if type(name) == list:
-               P = torch.from_numpy(np.stack([self.correspondence[sub_n + "_{}".format(direction)]["P"] for sub_n in name]))
-               P = P.unsqueeze(1).repeat(1,8,1,1).reshape(-1,3,4).to(points.device)
+               P = torch.from_numpy(np.stack([self.correspondence[sub_n]["P"] for sub_n in name]))
+               P = P.unsqueeze(1).repeat(1,n_pts,1,1).reshape(-1,3,4).to(points.device)
                points = points.unsqueeze(1).transpose(1,2)
                new_pts = torch.bmm(P,points).squeeze(2)
        else:
@@ -935,24 +974,31 @@ class Curvilinear_Homography():
        new_pts = new_pts.view(d,-1,2)
        return new_pts 
     
-    def im_to_space(self,points, name = None,heights = None):
+    def im_to_space(self,points, name = None,heights = None,classes = None,refine_heights = True):
         """
         Wrapper function on _im_sp necessary because it is not immediately evident 
         from points in image whether the EB or WB corespondence should be used
         
         points    - [d,m,2] array of points in image
         name      - list of correspondence key names
-        heights   - [d] tensor of object heights
+        heights   - [d] tensor of object heights, 0, or None (use classes)
+        classes   - None or [d] tensor of object classes
         RETURN:     [d,m,3] array of points in space 
         """
-        boxes  = self._im_sp(points,name = name, heights = heights,direction = "EB")
-        boxes2 = self._im_sp(points,name = name, heights = heights,direction = "EB")
-
-        # get indices where to use boxes1 and where to use boxes2 based on centerline y
         
-        # TODO - change this to use get_direction
-        ind = torch.where(boxes[:,0,1] > 60)[0] 
-        boxes[ind,:,:] = boxes2[ind,:,:]
+        if heights is None:
+            if classes is None: 
+                raise IOError("Either heights or classes must not be None")
+            else:
+                heights = self.guess_heights(classes)
+                
+        boxes  = self._im_sp(points,name = name, heights = 0)
+        
+        # get directions and append to names
+        name = self.get_direction(points,name)[0]
+        
+        # recompute with correct directions
+        boxes = self._im_sp(points,name = name, heights = heights, refine_heights=refine_heights)
         return boxes
     
     def space_to_im(self, points, name = None):
@@ -965,13 +1011,7 @@ class Curvilinear_Homography():
         RETURN:   [d,m,2] array of points in 2-space
         """
         
-        boxes  = self._sp_im(points,name = name, direction = "EB")
-        boxes2 = self._sp_im(points,name = name, direction = "WB")
-        
-        # get indices where to use boxes1 and where to use boxes2 based on centerline y
-        # TODO - modify to use get_direction 
-        ind = torch.where(points[:,0,1] > 60)[0]
-        boxes[ind,:] = boxes2[ind,:]        
+        boxes  = self._sp_im(points,name = name)      
         return boxes
         
     def im_to_state(self,points, name = None, heights = None):
@@ -1034,7 +1074,8 @@ class Curvilinear_Homography():
         new_pts[:,4] = torch.mean(torch.abs( (points[:,0:4,2] - points[:,4:8,2])),dim = 1)
         
         # direction is +1 if vehicle is traveling along direction of increasing x, otherwise -1
-        new_pts[:,5] = torch.sign( ((points[:,0,0] + points[:,1,0]) - (points[:,2,0] + points[:,3,0]))/2.0 ) 
+        directions = self.get_direction(points)[1]
+        new_pts[:,5] = directions #torch.sign( ((points[:,0,0] + points[:,1,0]) - (points[:,2,0] + points[:,3,0]))/2.0 ) 
         
         
         # TODO - for now just do single pass, and see whether accuracy and speed are good enough
@@ -1065,7 +1106,6 @@ class Curvilinear_Homography():
         # 5. Final state space obtained
         return new_pts
         
-    
     def state_to_space(self,points):
         """
         Conversion from state plane coordinates to roadway coordinates via the following steps:
@@ -1077,6 +1117,9 @@ class Curvilinear_Homography():
             6. Add top points
             
         Note that by convention 3D box point ordering  = fbr,fbl,bbr,bbl,ftr,ftl,fbr,fbl and roadway coordinates reference back center of vehicle
+        
+        points - [d,s] array of boxes in state space where s is state size (probably 6)
+        
         """
         
         # 1. get x-y coordinate of closest point along spline (i.e. v = 0)
@@ -1129,33 +1172,254 @@ class Curvilinear_Homography():
         
         return new_pts
     
+    def get_direction(self,points,name = None):
+        """
+        Find closest point on spline. use relative x_coordinate difference (in state plane coords) to determine whether point is below spline (EB) or above spline (WB)
+        
+        
+        points    - [d,m,3] array of points in space
+        name      - list of correspondence key names. THey are not needed but if supplied the correct directions will be appended to them
+        RETURN:   - [d] list of names with "EB" or "WB" added, best guess of which side of road object is on and which correspondence should be used
+                  - [d] tensor of int with -1 if "WB" and 1 if "EB" per object
+        """
+        d = points.shape[0]
+        n_grid_points = len(self.spline_cache[0])
+        mean_points = torch.mean(points, dim = 1)
+        x_grid = self.spline_cache[1].unsqueeze(0).expand(d,n_grid_points)        
+        y_grid = self.spline_cache[2].unsqueeze(0).expand(d,n_grid_points)
+        x_pts  = mean_points[:,0].unsqueeze(1).expand(d,n_grid_points)
+        y_pts  = mean_points[:,1].unsqueeze(1).expand(d,n_grid_points)
+        
+        dist = torch.sqrt((x_grid - x_pts)**2 + (y_grid - y_pts)**2)
+        
+        # get min_idx for each object
+        min_idx = torch.argmin(dist,dim = 1)
+        min_u = self.spline_cache[0][min_idx]
+        
+        spl_x,_ = interpolate.splev(min_u, self.median_tck)
+        
+        direction = torch.sign(torch.from_numpy(spl_x) - mean_points[:,0]).int()
+        d_list = ["EB","WB"]
+        string_direction = [d_list[di.item()] for di in direction]
+                                
+        if name is not None:
+            
+            if type(name) == str:
+                new_name = name + "_{}".format(string_direction[0])
+            
+            elif type(name) == list:
+                new_name = []
+                for n_idx in range(len(name)):
+                    new_name.append(name[n_idx] + "_{}".format(string_direction[n_idx]))
+            
+        return new_name, direction
     
     
-    def get_direction(self):
-        pass
+    def guess_heights(self,classes):
+        """
+        classes - [d] vector of string class names
+        
+        returns - [d] vector of float object height guesses
+        """
+        
+        heights = torch.zeros(len(classes))
+        
+        for i in range(len(classes)):
+            try:
+                heights[i] = self.class_heights[classes[i]]
+            except KeyError:
+                heights[i] = self.class_heights["other"]
+            
+        return heights
     
-    def class_height(self):
-        pass
-    
-    def height_from_template(self):
-        pass
+    def height_from_template(self,template_boxes,template_space_heights,boxes):
+        """
+        Predicts space height of boxes in image space. Given a space height and 
+        the corresponding image box (and thus image height), the relationship 
+        between heights in different coordinate systems should be roughly estimable. 
+        This strategy is used to guess the heights of the second set of boxes in
+        image space according to : 
+            template_im_heights:template_space_heights = new_im_heights:new_box heights
+            
+        template_boxes - [d,m,2,] array of points corresponding to d object boxes 
+                         (typical usage would be to use boxes from previous frame
+                         or apriori box predictions for current frame))
+        template_space_heights - [d] array of corresponding object heights in space
+        boxes - [d,m,2] array of points in image
+        
+        returns
+        
+        height - [d] array of object heights in space
+        """
+        
+        # get rough heights of objects in image
+        template_top = torch.mean(template_boxes[:,4:8,:],dim = 1)
+        template_bottom = torch.mean(template_boxes[:,0:4,:],dim = 1)
+        template_im_height = torch.sum(torch.sqrt(torch.pow((template_top - template_bottom),2)),dim = 1)
+        template_ratio = template_im_height / template_space_heights
+        
+        box_top    = torch.mean(boxes[:,4:8,:],dim = 1)
+        box_bottom = torch.mean(boxes[:,0:4,:],dim = 1)
+        box_height = torch.sum(torch.sqrt(torch.pow((box_top - box_bottom),2)),dim = 1)
+        
+        height = box_height / template_ratio
+        return height
+
+
+        height = box_height / template_ratio
+        return height
     
     #%% Testing Functions
     
     def test_transformation(self):
-        pass
-    
-    def check_extents(self):
-        pass
+        """
+        A series of tests will be run
+        
+        1. Transform a set of image points into space then state, then back to space then image
+           - get average and max error (in pixels)
+           
+        2. Transform a set of randomly created boxes into space then image, then back to space then state
+           - get average state error (in feet)
+           
+        3. Transform the same set of boxes back into image, and get average pixel error
+        """
+        
+        
+        ### Project each aerial imagery point into pixel space and get pixel error
+        print("Test 1: Pixel Reprojection Error\n")
+        
+        running_error = []
+        for name in self.correspondence.keys():
+            corr = self.correspondence[name]
+            name = name.split("_")[0]
+            
+            space_pts = torch.from_numpy(corr["space_pts"]).unsqueeze(1)
+            space_pts = torch.cat((space_pts,torch.zeros([space_pts.shape[0],1,1])), dim = -1)
+            
+            im_pts    = torch.from_numpy(corr["corr_pts"])
+            namel = [name for _ in range(len(space_pts))]
+            
+            proj_space_pts = self.space_to_im(space_pts,name = namel).squeeze(1)
+            error = torch.sqrt(((proj_space_pts - im_pts)**2).sum(dim = 1)).mean()
+            print("Mean error for {}: {}px".format(name,error))
+            running_error.append(error)
+            
+        print("Average Pixel Reprojection Error across all homographies: {}px".format(sum(running_error)/len(running_error)))
+            
+        
+        
+        ### Project each camera point into state plane coordinates and get ft error
+        print("Test 2: State Reprojection Error\n")
+        running_error = []
+        for name in self.correspondence.keys():
+            corr = self.correspondence[name]
+            name = name.split("_")[0]
+
+            
+            space_pts = torch.from_numpy(corr["space_pts"])
+            space_pts = torch.cat((space_pts,torch.zeros([space_pts.shape[0],1])), dim = -1)
+
+            im_pts    = torch.from_numpy(corr["corr_pts"]).unsqueeze(1).float()
+            namel = [name for _ in range(len(space_pts))]
+
+            proj_im_pts = self.im_to_space(im_pts,name = namel, heights = 0, refine_heights = False).squeeze(1)
+            
+            error = torch.sqrt(((proj_im_pts - space_pts)**2).sum(dim = 1)).mean()
+            print("Mean error for {}: {}ft".format(name,error))
+            running_error.append(error)
+        
+        print("Average Space Reprojection Error across all homographies: {}ft".format(sum(running_error)/len(running_error)))
+        
     
     #%% Plotting Functions
     
-    def plot_boxes(self):
-        pass
+    def plot_boxes(self,im,boxes,color = (255,255,255),labels = None,thickness = 1):
+        """
+        As one might expect, plots 3D boxes on input image
+        
+        im - cv2 matrix-style image
+        boxes - [d,8,2] array of image points where d indexes objects
+        color - 3-tuple specifying box color to plot
+        """
+                
+        DRAW = [[0,1,1,0,1,0,0,0], #bfl
+                [0,0,0,1,0,1,0,0], #bfr
+                [0,0,0,1,0,0,1,1], #bbl
+                [0,0,0,0,0,0,1,1], #bbr
+                [0,0,0,0,0,1,1,0], #tfl
+                [0,0,0,0,0,0,0,1], #tfr
+                [0,0,0,0,0,0,0,1], #tbl
+                [0,0,0,0,0,0,0,0]] #tbr
+        
+        DRAW_BASE = [[0,1,1,1], #bfl
+                     [0,0,1,1], #bfr
+                     [0,0,0,1], #bbl
+                     [0,0,0,0]] #bbr
+        
+        for idx, bbox_3d in enumerate(boxes):
+            
+            # check whether box mostly falls within frame
+            if torch.min(bbox_3d[:,:,0]) < -100 or torch.max(bbox_3d[:,:,0]) > 3940 or torch.min(bbox_3d[:,:,1]) < -100 or torch.max(bbox_3d[:,:,1]) > 2260:
+                continue
+            
+            if type(color) == np.ndarray:
+                c = (int(color[idx,0]),int(color[idx,1]),int(color[idx,2]))
+            else:
+                c = color
+            
+
+            
+            for a in range(len(bbox_3d)):
+                ab = bbox_3d[a]
+                for b in range(a,len(bbox_3d)):
+                    bb = bbox_3d[b]
+                    if DRAW[a][b] == 1:
+                        #try:
+                            im = cv2.line(im,(int(ab[0]),int(ab[1])),(int(bb[0]),int(bb[1])),c,thickness)
+                        #except:
+                            pass
+        
+            if labels is not None:
+                label = labels[idx]
+                left  = bbox_3d[0,0]
+                top   = bbox_3d[0,1]
+                im    = cv2.putText(im,"{}".format(label),(int(left),int(top - 10)),cv2.FONT_HERSHEY_PLAIN,2,(0,0,0),3)
+                im    = cv2.putText(im,"{}".format(label),(int(left),int(top - 10)),cv2.FONT_HERSHEY_PLAIN,2,(255,255,255),1)
+            
+        return im
+        
+    def plot_state_boxes(self,im,boxes,color = (255,255,255),labels = None, thickness = 1, name = None):
+        """
+        Wraps plot_boxes for state boxes by first converting from state (roadway coordinates) to image coordinates
+        """
+        im_boxes = self.state_to_im(boxes, name = name)
+        self.plot_boxes(im,im_boxes,color = color,labels = labels, thickness = thickness)
     
-    def plot_points(self):
-        pass
+    def plot_points(self,im,points, color = (0,255,0)):
+        """
+        Lazily, duplicate each point 8 times as a box with 0 l,w,h then call plot_boxes
+        points -  [d,2] array of x,y points in roadway coordinates / state 
+        """
+        rep_points = torch.cat(points,torch.zeros(points.shape[0],3),dim = 1)
+        space_points = self.state_to_space(rep_points)
+        self.plot_space_points(im,space_points,color = color)
     
+    def plot_space_points(self,im,points,color = (255,0,0), name = None):
+        """
+        points -  [d,n,3] array of x,y points in roadway coordinates / state 
+        """
+        
+        im_pts = self.space_to_im(points, name = name)
+        
+        for point in im_pts:
+            cv2.circle(im,(int(point[0]),int(point[1])),2,color,-1)
+        
+        cv2.imshow("frame",im)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    
+        
+        
     def plot_homography(self,
                         SPLINE  = False,
                         IM_PTS  = False,
@@ -1169,5 +1433,7 @@ class Curvilinear_Homography():
 if __name__ == "__main__":
     im_dir = "/home/derek/Documents/i24/i24_homography/data_real"
     space_dir = "/home/derek/Documents/i24/i24_homography/aerial/to_P24"
+    save_file = "new_hg_save.cpkl"
 
-    hg = Curvilinear_Homography(space_dir = space_dir, im_dir = im_dir)
+    hg = Curvilinear_Homography(save_file = save_file,space_dir = space_dir, im_dir = im_dir)
+    hg.test_transformation()
