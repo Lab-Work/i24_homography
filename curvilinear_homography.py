@@ -910,7 +910,7 @@ class Curvilinear_Homography():
             if n_pts == 8:
                 new_pts[:,4:,:] = new_pts[:,:4,:]
             
-                if heights != 0: 
+                if type(heights) == torch.Tensor: 
                     new_pts[:,[4,5,6,7],2] = heights.unsqueeze(1).repeat(1,4).double()
             
         else:
@@ -919,7 +919,7 @@ class Curvilinear_Homography():
         
         if refine_heights:
             template_boxes = self.space_to_im(new_pts,name)
-            heights_new = self.height_from_template(template_boxes, heights, points)
+            heights_new = self.height_from_template(template_boxes, heights, new_pts)
             new_pts[:,[4,5,6,7],2] = heights_new.unsqueeze(1).repeat(1,4).double()
             
         return new_pts
@@ -1014,7 +1014,7 @@ class Curvilinear_Homography():
         boxes  = self._sp_im(points,name = name)      
         return boxes
         
-    def im_to_state(self,points, name = None, heights = None):
+    def im_to_state(self,points, name = None, heights = None,refine_heights = True):
         """
         Converts image boxes to roadway coordinate boxes
         points    - [d,m,2] array of points in image
@@ -1022,7 +1022,7 @@ class Curvilinear_Homography():
         heights   - [d] tensor of object heights
         RETURN:     [d,s] array of boxes in state space where s is state size (probably 6)
         """
-        space_pts = self.im_to_space(points,name = name, heights = heights)
+        space_pts = self.im_to_space(points,name = name, heights = heights,refine_heights = refine_heights)
         return self.space_to_state(space_pts)
     
     def state_to_im(self,points,name = None):
@@ -1043,7 +1043,10 @@ class Curvilinear_Homography():
             3. Search coarse grid for best fit point for each point
             4. Search fine grid for best offset relative to each coarse point
             5. Final state space obtained
-            
+        
+        Note that by convention 3D box point ordering  = fbr,fbl,bbr,bbl,ftr,ftl,fbr,fbl and roadway coordinates reference back center of vehicle
+
+        
         points - [d,m,3] 
         RETURN:  [d,s] array of boxes in state space where s is state size (probably 6)
         """
@@ -1054,24 +1057,34 @@ class Curvilinear_Homography():
         
         # 2. Convert space points to L,W,H,x_back,y_center
         d = points.shape[0]
+        n_pts = points.shape[1]
+        
         new_pts = torch.zeros([d,6],device = points.device)
         
         # rear center bottom of vehicle is (x,y)
         
-        # x is computed as average of two bottom rear points
-        new_pts[:,0] = (points[:,2,0] + points[:,3,0]) / 2.0
-        
-        # y is computed as average 4 bottom point y values
-        new_pts[:,1] = (points[:,0,1] + points[:,1,1] +points[:,2,1] + points[:,3,1]) / 4.0
-        
-        # l is computed as avg length between bottom front and bottom rear
-        new_pts[:,2] = torch.abs ( ((points[:,0,0] + points[:,1,0]) - (points[:,2,0] + points[:,3,0]))/2.0 )
-        
-        # w is computed as avg length between botom left and bottom right
-        new_pts[:,3] = torch.abs(  ((points[:,0,1] + points[:,2,1]) - (points[:,1,1] + points[:,3,1]))/2.0)
+        if n_pts == 8:
+            # x is computed as average of two bottom rear points
+            new_pts[:,0] = (points[:,2,0] + points[:,3,0]) / 2.0
+            
+            # y is computed as average of two bottom rear points 
+            new_pts[:,1] = (points[:,2,1] + points[:,3,1]) / 2.0
 
-        # h is computed as avg length between all top and all bottom points
-        new_pts[:,4] = torch.mean(torch.abs( (points[:,0:4,2] - points[:,4:8,2])),dim = 1)
+            
+            # l is computed as avg length between bottom front and bottom rear
+            #new_pts[:,2] = torch.abs ( ((points[:,0,0] + points[:,1,0]) - (points[:,2,0] + points[:,3,0]))/2.0 )
+            new_pts[:,2] = torch.pow((points[:,[0,1,4,5],:] - points[:,[2,3,6,7],:]).mean(dim = 1),2).sum(dim = 1).sqrt()
+            
+            # w is computed as avg length between botom left and bottom right
+            new_pts[:,3] = torch.pow((points[:,[0,2,4,6],:] - points[:,[1,3,5,7],:]).mean(dim = 1),2).sum(dim = 1).sqrt()
+
+            # h is computed as avg length between all top and all bottom points
+            new_pts[:,4] = torch.mean(torch.abs( (points[:,0:4,2] - points[:,4:8,2])),dim = 1)
+        
+        else:
+            new_pts[:,0] = points[:,0,0]
+            new_pts[:,1] = points[:,0,1]
+            
         
         # direction is +1 if vehicle is traveling along direction of increasing x, otherwise -1
         directions = self.get_direction(points)[1]
@@ -1092,7 +1105,7 @@ class Curvilinear_Homography():
         dist = torch.sqrt((x_grid - x_pts)**2 + (y_grid - y_pts)**2)
         
         # get min_idx for each object
-        min_idx = torch.argmin(dist,dim = 0)
+        min_idx = torch.argmin(dist,dim = 1)
         it = [i for i in range(d)]
         min_dist = dist[it,min_idx]
         min_u = self.spline_cache[0][min_idx]
@@ -1124,51 +1137,71 @@ class Curvilinear_Homography():
         
         # 1. get x-y coordinate of closest point along spline (i.e. v = 0)
         d = points.shape[0]
-        closest_median_point_x, closest_median_point_y = self.splev(points[:,0],self.median_tck)
+        closest_median_point_x, closest_median_point_y = interpolate.splev(points[:,0],self.median_tck)
         
         # 2. get derivative of spline at that point
-        l_direction_x,l_direction_y          = self.splev(points[:,0],self.median_tck, der = 1)
+        l_direction_x,l_direction_y          = interpolate.splev(points[:,0],self.median_tck, der = 1)
 
         # 3. get perpendicular direction at that point
-        w_direction_x,w_direction_y          = -1/l_direction_x  , -1/l_direction_y
+        #w_direction_x,w_direction_y          = -1/l_direction_x  , -1/l_direction_y
+        w_direction_x,w_direction_y = l_direction_y,-l_direction_x
         
+        # numpy to torch - this is not how you should write this but I was curious
+        [closest_median_point_x,
+        closest_median_point_y,
+        l_direction_x,
+        l_direction_y,
+        w_direction_x,
+        w_direction_y] = [torch.from_numpy(arr) for arr in [closest_median_point_x,
+                                                           closest_median_point_y,
+                                                           l_direction_x,
+                                                           l_direction_y,
+                                                           w_direction_x,
+                                                           w_direction_y]]
+        direction = torch.sign(points[:,1])
+                                                            
         # 4. Shift x-y point in that direction
         hyp_l = torch.sqrt(l_direction_x**2 + l_direction_y **2)
         hyp_w = torch.sqrt(w_direction_x**2 + w_direction_y **2)
         
         # shift associated with the length of the vehicle, in x-y space
-        x_shift_l    = torch.sqrt(l_direction_x**2 / (hyp_l**2)) * points[:,2]
-        y_shift_l    = torch.sqrt(l_direction_y**2 / (hyp_l**2)) * points[:,2] 
+        x_shift_l    = l_direction_x /hyp_l * points[:,2] * direction
+        y_shift_l    = l_direction_y /hyp_l * points[:,2] * direction
         
         # shift associated with the width of the vehicle, in x-y space
-        x_shift_w    = torch.sqrt(w_direction_x**2 / (hyp_w**2)) * (points[:,3]/2.0)
-        y_shift_w    = torch.sqrt(w_direction_y**2 / (hyp_w**2)) * (points[:,3]/2.0)
+        x_shift_w    = w_direction_x/hyp_w * (points[:,3]/2.0) * direction
+        y_shift_w    = w_direction_y/hyp_w * (points[:,3]/2.0) * direction
         
         # shift associated with the perp distance of the object from the median, in x-y space
-        x_shift_perp = torch.sqrt(w_direction_x**2 / (hyp_w**2)) * points[:,1]
-        y_shift_perp = torch.sqrt(w_direction_y**2 / (hyp_w**2)) * points[:,1]
+        x_shift_perp = w_direction_x/hyp_w * points[:,1] # * direction # points already incorporates sign you dingus!!
+        y_shift_perp = w_direction_y/hyp_w * points[:,1] # * direction
         
         # 5. Offset base points in each constituent direction
         
-        new_pts = torch.zeros[d,4,3]
+        new_pts = torch.zeros([d,4,3])
         
         # shift everything to median point
-        new_pts[:,:,0] = closest_median_point_x + x_shift_perp
-        new_pts[:,:,1] = closest_median_point_y + y_shift_perp
+        new_pts[:,:,0] = closest_median_point_x.unsqueeze(1).expand(d,4) + x_shift_perp.unsqueeze(1).expand(d,4)
+        new_pts[:,:,1] = closest_median_point_y.unsqueeze(1).expand(d,4) + y_shift_perp.unsqueeze(1).expand(d,4)
         
         # shift front points
-        new_pts[:,[0,1],0] += x_shift_l
-        new_pts[:,[0,1],1] += y_shift_l
+        new_pts[:,[0,1],0] += x_shift_l.unsqueeze(1).expand(d,2)
+        new_pts[:,[0,1],1] += y_shift_l.unsqueeze(1).expand(d,2)
         
-        new_pts[:,[0,2],0] += x_shift_w
-        new_pts[:,[0,2],1] += y_shift_w
-        new_pts[:,[1,3],0] -= x_shift_w
-        new_pts[:,[1,3],1] -= y_shift_w
+        new_pts[:,[0,2],0] += x_shift_w.unsqueeze(1).expand(d,2)
+        new_pts[:,[0,2],1] += y_shift_w.unsqueeze(1).expand(d,2)
+        new_pts[:,[1,3],0] -= x_shift_w.unsqueeze(1).expand(d,2)
+        new_pts[:,[1,3],1] -= y_shift_w.unsqueeze(1).expand(d,2)
     
         #6. Add top points
         top_pts = new_pts.clone()
-        top_pts[:,:,2] += points[:,4]
+        top_pts[:,:,2] += points[:,4].unsqueeze(1).expand(d,4)
         new_pts = torch.cat((new_pts,top_pts),dim = 1)
+        
+        
+        
+        #test
+        test_direction = self.get_direction(new_pts)[1]
         
         return new_pts
     
@@ -1201,7 +1234,9 @@ class Curvilinear_Homography():
         direction = torch.sign(torch.from_numpy(spl_x) - mean_points[:,0]).int()
         d_list = ["EB","WB"]
         string_direction = [d_list[di.item()] for di in direction]
-                                
+        
+    
+        new_name = None                        
         if name is not None:
             
             if type(name) == str:
@@ -1266,70 +1301,7 @@ class Curvilinear_Homography():
         return height
 
 
-        height = box_height / template_ratio
-        return height
-    
-    #%% Testing Functions
-    
-    def test_transformation(self):
-        """
-        A series of tests will be run
-        
-        1. Transform a set of image points into space then state, then back to space then image
-           - get average and max error (in pixels)
-           
-        2. Transform a set of randomly created boxes into space then image, then back to space then state
-           - get average state error (in feet)
-           
-        3. Transform the same set of boxes back into image, and get average pixel error
-        """
-        
-        
-        ### Project each aerial imagery point into pixel space and get pixel error
-        print("Test 1: Pixel Reprojection Error\n")
-        
-        running_error = []
-        for name in self.correspondence.keys():
-            corr = self.correspondence[name]
-            name = name.split("_")[0]
-            
-            space_pts = torch.from_numpy(corr["space_pts"]).unsqueeze(1)
-            space_pts = torch.cat((space_pts,torch.zeros([space_pts.shape[0],1,1])), dim = -1)
-            
-            im_pts    = torch.from_numpy(corr["corr_pts"])
-            namel = [name for _ in range(len(space_pts))]
-            
-            proj_space_pts = self.space_to_im(space_pts,name = namel).squeeze(1)
-            error = torch.sqrt(((proj_space_pts - im_pts)**2).sum(dim = 1)).mean()
-            print("Mean error for {}: {}px".format(name,error))
-            running_error.append(error)
-            
-        print("Average Pixel Reprojection Error across all homographies: {}px".format(sum(running_error)/len(running_error)))
-            
-        
-        
-        ### Project each camera point into state plane coordinates and get ft error
-        print("Test 2: State Reprojection Error\n")
-        running_error = []
-        for name in self.correspondence.keys():
-            corr = self.correspondence[name]
-            name = name.split("_")[0]
-
-            
-            space_pts = torch.from_numpy(corr["space_pts"])
-            space_pts = torch.cat((space_pts,torch.zeros([space_pts.shape[0],1])), dim = -1)
-
-            im_pts    = torch.from_numpy(corr["corr_pts"]).unsqueeze(1).float()
-            namel = [name for _ in range(len(space_pts))]
-
-            proj_im_pts = self.im_to_space(im_pts,name = namel, heights = 0, refine_heights = False).squeeze(1)
-            
-            error = torch.sqrt(((proj_im_pts - space_pts)**2).sum(dim = 1)).mean()
-            print("Mean error for {}: {}ft".format(name,error))
-            running_error.append(error)
-        
-        print("Average Space Reprojection Error across all homographies: {}ft".format(sum(running_error)/len(running_error)))
-        
+         
     
     #%% Plotting Functions
     
@@ -1421,7 +1393,7 @@ class Curvilinear_Homography():
         
         
     def plot_homography(self,
-                        SPLINE  = False,
+                        MEDIAN  = False,
                         IM_PTS  = False,
                         FIT_PTS = False,
                         FOV     = False,
@@ -1429,6 +1401,121 @@ class Curvilinear_Homography():
                         Z_AXIS  = False):
         pass
     
+    
+    #%% Testing Functions
+    
+    def test_transformation(self):
+        """
+        A series of tests will be run
+        
+        1. Transform a set of image points into space then state, then back to space then image
+           - get average and max error (in pixels)
+           
+        2. Transform a set of randomly created boxes into space then image, then back to space then state
+           - get average state error (in feet)
+           
+        3. Transform the same set of boxes back into image, and get average pixel error
+        """
+        
+        
+        ### Project each aerial imagery point into pixel space and get pixel error
+        if True:
+            print("Test 1: Pixel Reprojection Error\n")
+            
+            running_error = []
+            for name in self.correspondence.keys():
+                corr = self.correspondence[name]
+                name = name.split("_")[0]
+                
+                space_pts = torch.from_numpy(corr["space_pts"]).unsqueeze(1)
+                space_pts = torch.cat((space_pts,torch.zeros([space_pts.shape[0],1,1])), dim = -1)
+                
+                im_pts    = torch.from_numpy(corr["corr_pts"])
+                namel = [name for _ in range(len(space_pts))]
+                
+                proj_space_pts = self.space_to_im(space_pts,name = namel).squeeze(1)
+                error = torch.sqrt(((proj_space_pts - im_pts)**2).sum(dim = 1)).mean()
+                print("Mean error for {}: {}px".format(name,error))
+                running_error.append(error)   
+            print("Average Pixel Reprojection Error across all homographies: {}px".format(sum(running_error)/len(running_error)))
+            
+        
+        ### Project each camera point into state plane coordinates and get ft error
+        if True:
+            print("Test 2: State Reprojection Error\n")
+            running_error = []
+            
+            all_im_pts = []
+            all_cam_names = []
+            for name in self.correspondence.keys():
+                corr = self.correspondence[name]
+                name = name.split("_")[0]
+    
+                
+                space_pts = torch.from_numpy(corr["space_pts"])
+                space_pts = torch.cat((space_pts,torch.zeros([space_pts.shape[0],1])), dim = -1)
+    
+                im_pts    = torch.from_numpy(corr["corr_pts"]).unsqueeze(1).float()
+                namel = [name for _ in range(len(space_pts))]
+    
+                all_im_pts.append(im_pts)
+                all_cam_names += namel
+    
+                proj_im_pts = self.im_to_space(im_pts,name = namel, heights = 0, refine_heights = False).squeeze(1)
+                
+                error = torch.sqrt(((proj_im_pts - space_pts)**2).sum(dim = 1)).mean()
+                print("Mean error for {}: {}ft".format(name,error))
+                running_error.append(error)
+            print("Average Space Reprojection Error across all homographies: {}ft".format(sum(running_error)/len(running_error)))
+        
+        if True:
+            ### Create a random set of boxes
+            boxes = torch.rand(1000,6) 
+            boxes[:,0] = boxes[:,0] * (self.median_u[-1] - self.median_u[0]) + self.median_u[0]
+            boxes[:,1] = boxes[:,1] * 120 - 60
+            boxes[:,2] *= 60
+            boxes[:,3] *= 10
+            boxes[:,4] *= 10
+            boxes[:,5] = torch.sign(boxes[:,1])
+
+            
+            space_boxes = self.state_to_space(boxes)
+            repro_state_boxes = self.space_to_state(space_boxes)
+            
+            error = torch.abs(repro_state_boxes - boxes)
+            mean_error = error.mean(dim = 0)
+            print("Mean State-Space-State Error: {}ft".format(mean_error))
+        
+        if True:
+            print("Test 3: Random Box Reprojection Error (State-Im-State) \n")
+            
+            all_im_pts = torch.cat(all_im_pts,dim = 0)
+            state_pts = self.im_to_state(all_im_pts, name = all_cam_names, heights = 0,refine_heights = False)
+            
+            ### Create a random set of boxes
+            boxes = torch.rand(state_pts.shape[0],6) 
+            boxes[:,:2] = state_pts[:,:2]
+            #boxes[:,1] = boxes[:,1] * 240 - 120
+            boxes[:,2] *= 60
+            boxes[:,3] *= 10
+            boxes[:,4] *= 10
+            boxes[:,5] = torch.sign(boxes[:,1])
+            
+            # get appropriate camera for each object
+            
+            
+            im_boxes = self.state_to_im(boxes,name = all_cam_names)
+            
+            # plot some of the boxes
+            repro_state_boxes = self.im_to_state(im_boxes,name = all_cam_names,heights = boxes[:,4],refine_heights = True)
+            
+            
+            error = torch.abs(repro_state_boxes - boxes)
+            error = torch.mean(error,dim = 0)
+            print("Average State-Im_State Reprojection Error: {} ft".format(error))
+        
+        
+#%% MAIN        
     
 if __name__ == "__main__":
     im_dir = "/home/derek/Documents/i24/i24_homography/data_real"
