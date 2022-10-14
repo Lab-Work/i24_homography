@@ -104,7 +104,7 @@ class Curvilinear_Homography():
         if save_file is not None:
             with open(save_file,"rb") as f:
                 # everything in correspondence is pickleable without object definitions to allow compatibility after class definitions change
-                self.correspondence,self.median_tck,self.median_u = pickle.load(f)
+                self.correspondence,self.median_tck,self.median_u,self.guess_tck = pickle.load(f)
             
             # reload  parameters of curvilinear axis spline
             # rather than the spline itself for better pickle reloading compatibility
@@ -119,12 +119,12 @@ class Curvilinear_Homography():
             #  fit the axis spline once and collect extents
             self._fit_spline(space_dir)
             #self._get_extents()    
-        
-        print("caching spline points")
-        self._cache_spline_points()
-        
+            
         self.save("new_hg_save.cpkl")
         
+        #self._cache_spline_points()
+
+
         # object class info doesn't really belong in homography but it's unclear
         # where else it should go, and this avoids having to pass it around 
         # for use in height estimation
@@ -160,10 +160,9 @@ class Curvilinear_Homography():
                     7:"trailer"
                     }
         
-        
     def save(self,save_file):
         with open(save_file,"wb") as f:
-            pickle.dump([self.correspondence,self.median_tck,self.median_u],f)
+            pickle.dump([self.correspondence,self.median_tck,self.median_u,self.guess_tck],f)
         
         
     def generate(self,
@@ -185,6 +184,8 @@ class Curvilinear_Homography():
         scale_factor   - float - sampling frequency (ft) along spline, lower is slower but more accurate
         ADD_PROJ       - bool - if true, compute points along yellow line to use in homography
         """
+        
+        print("Generating homography")
         
         ae_x = []
         ae_y = []
@@ -529,6 +530,9 @@ class Curvilinear_Homography():
                     self.correspondence["{}_{}".format(camera,"WB")] = self.correspondence["{}_{}".format(camera,"EB")]
     
     def _fit_z_vp(self,cor,im_data,direction):
+        
+        print("fitting Z coordinate scale")
+        
         P_orig = cor["P"].copy()
         
         max_scale = 10000
@@ -636,7 +640,7 @@ class Curvilinear_Homography():
         cor["P"] = P_new
             
         
-        print("Best Error: {}".format(best_error))
+        #print("Best Error: {}".format(best_error))
         
     def _fit_spline(self,space_dir,use_MM_offset = False):
         """
@@ -657,6 +661,9 @@ class Curvilinear_Homography():
             space_dir - str - path to directory with csv files of attributes labeled in space coordinates
             use_MM_offset - bool - if True, offset according to I-24 highway mile markers
         """
+        
+        print("Fitting median spline..")
+        
         samples_per_foot = 10
         splines = {}
         
@@ -819,6 +826,11 @@ class Curvilinear_Homography():
         self.median_tck = final_tck
         self.median_u = final_u
         
+        # get the inverse spline g(x) = u for guessing initial spline point
+        ae_spl_u = np.array(ae_spl_u)
+        print(ae_data.shape,ae_spl_u.shape)
+
+        self.guess_tck = interpolate.splrep(ae_data[0],ae_spl_u)
         
         if use_MM_offset:
             # 11. Optionally, compute a median spline distance offset from mile markers
@@ -830,20 +842,62 @@ class Curvilinear_Homography():
             self.median_tck = final_tck
             self.median_u = final_u
     
-    def _cache_spline_points(self,granularity = 0.1):
-        """
-        Caches u,x, and y for a grid with specified granularity
-        granularity - float
-        RETURN: None, but sets self.spline_cache as [n,3] tensor of u,x,y
-        """
-        umin = min(self.median_u)
-        umax = max(self.median_u)
-        count = int((umax-umin)*1/granularity)
-        u_prime = np.linspace(umin,umax,count)
-        med_x_prime, med_y_prime = interpolate.splev(u_prime, self.median_tck)
+    # def _cache_spline_points(self,granularity = 0.1):
+    #     """
+    #     Caches u,x, and y for a grid with specified granularity
+    #     granularity - float
+    #     RETURN: None, but sets self.spline_cache as [n,3] tensor of u,x,y
+    #     """
+    #     umin = min(self.median_u)
+    #     umax = max(self.median_u)
+    #     count = int((umax-umin)*1/granularity)
+    #     u_prime = np.linspace(umin,umax,count)
+    #     med_x_prime, med_y_prime = interpolate.splev(u_prime, self.median_tck)
         
-        self.spline_cache = torch.stack([torch.from_numpy(arr) for arr in [u_prime,med_x_prime,med_y_prime]])
+    #     self.spline_cache = torch.stack([torch.from_numpy(arr) for arr in [u_prime,med_x_prime,med_y_prime]])
     
+    def closest_spline_point(self,points, epsilon = 0.01, max_iterations = 100):
+        """
+        Given a tensor of points in 3D space, find the closest point on the median spline
+        for each point as follows:
+            1. Query self.guess_tck spline to get f(x) = u initial guess
+            2. Use Newton's method to find the point where dist = min
+      
+        points         - [d,3] tensor of points in state plane coordinates
+        epsilon        - float - keep iterating while max change > epsilon or ii.
+        max_iterations - int - ii. keep iterating until n_iterations = max_iterations
+        RETURNS:         [d] tensor of coordinates along spline axis
+        """
+        start = time.time()
+        # intial guess at closest u values
+        points = points.data.numpy()
+        guess_u = interpolate.splev(points[:,0],self.guess_tck)
+        
+        it = 0
+        max_change = np.inf
+        while it < max_iterations and max_change > epsilon:
+            spl_x,spl_y             = interpolate.splev(guess_u,self.median_tck)
+            spl_xx,spl_yy = interpolate.splev(guess_u,self.median_tck, der = 1)
+            spl_xxx,spl_yyy = interpolate.splev(guess_u,self.median_tck, der = 2)
+
+            
+            dist_proxy = (spl_x - points[:,0])**2 + (spl_y - points[:,1])**2
+            dist_proxy_deriv = (spl_x-points[:,0])*spl_xx + (spl_y-points[:,1])*spl_yy
+            dist_proxy_deriv2 = (2*spl_xx**2)+2*(spl_x-points[:,0])*spl_xxx + (2*spl_yy**2)+2*(spl_y-points[:,1])*spl_yyy
+            
+            
+            new_u = guess_u - dist_proxy_deriv/dist_proxy_deriv2
+            
+            max_change = np.max(np.abs(new_u-guess_u))
+            it += 1
+            
+            guess_u = new_u
+            
+            #print("Max step: {}".format(max_change))
+         
+        print("Newton method took {}s for {} points".format(time.time() - start,points.shape[0]))
+        return guess_u
+            
     
     def _fit_MM_offset(self):
         return 0
@@ -919,7 +973,7 @@ class Curvilinear_Homography():
         
         if refine_heights:
             template_boxes = self.space_to_im(new_pts,name)
-            heights_new = self.height_from_template(template_boxes, heights, new_pts)
+            heights_new = self.height_from_template(template_boxes, heights, points.view(d,8,3))
             new_pts[:,[4,5,6,7],2] = heights_new.unsqueeze(1).repeat(1,4).double()
             
         return new_pts
@@ -1051,9 +1105,6 @@ class Curvilinear_Homography():
         RETURN:  [d,s] array of boxes in state space where s is state size (probably 6)
         """
         
-        # 1. If spline points aren't yet cached, cache them
-        if self.spline_cache is None:
-            self.cache_spline_points()
         
         # 2. Convert space points to L,W,H,x_back,y_center
         d = points.shape[0]
@@ -1090,25 +1141,12 @@ class Curvilinear_Homography():
         directions = self.get_direction(points)[1]
         new_pts[:,5] = directions #torch.sign( ((points[:,0,0] + points[:,1,0]) - (points[:,2,0] + points[:,3,0]))/2.0 ) 
         
-        
-        # TODO - for now just do single pass, and see whether accuracy and speed are good enough
-        # 3. Search coarse grid for best fit point for each point
-        # 4. Search fine grid for best offset relative to each coarse point
 
-        # compute dist [d,n_grid_points]
-        n_grid_points = len(self.spline_cache[0])
-        x_grid = self.spline_cache[1].unsqueeze(0).expand(d,n_grid_points)        
-        y_grid = self.spline_cache[2].unsqueeze(0).expand(d,n_grid_points)
-        x_pts  = new_pts[:,0].unsqueeze(1).expand(d,n_grid_points)
-        y_pts  = new_pts[:,1].unsqueeze(1).expand(d,n_grid_points)
-        
-        dist = torch.sqrt((x_grid - x_pts)**2 + (y_grid - y_pts)**2)
-        
-        # get min_idx for each object
-        min_idx = torch.argmin(dist,dim = 1)
-        it = [i for i in range(d)]
-        min_dist = dist[it,min_idx]
-        min_u = self.spline_cache[0][min_idx]
+        min_u = self.closest_spline_point(new_pts[:,:2])
+        min_u = torch.from_numpy(min_u)
+        spl_x,spl_y = interpolate.splev(min_u,self.median_tck)
+        spl_x,spl_y = torch.from_numpy(spl_x),torch.from_numpy(spl_y)
+        min_dist = torch.sqrt((spl_x - new_pts[:,0])**2 + (spl_y - new_pts[:,1])**2)
         
         new_pts[:,0] = min_u
         new_pts[:,1] = min_dist
@@ -1215,19 +1253,9 @@ class Curvilinear_Homography():
         RETURN:   - [d] list of names with "EB" or "WB" added, best guess of which side of road object is on and which correspondence should be used
                   - [d] tensor of int with -1 if "WB" and 1 if "EB" per object
         """
-        d = points.shape[0]
-        n_grid_points = len(self.spline_cache[0])
+        
         mean_points = torch.mean(points, dim = 1)
-        x_grid = self.spline_cache[1].unsqueeze(0).expand(d,n_grid_points)        
-        y_grid = self.spline_cache[2].unsqueeze(0).expand(d,n_grid_points)
-        x_pts  = mean_points[:,0].unsqueeze(1).expand(d,n_grid_points)
-        y_pts  = mean_points[:,1].unsqueeze(1).expand(d,n_grid_points)
-        
-        dist = torch.sqrt((x_grid - x_pts)**2 + (y_grid - y_pts)**2)
-        
-        # get min_idx for each object
-        min_idx = torch.argmin(dist,dim = 1)
-        min_u = self.spline_cache[0][min_idx]
+        min_u  = self.closest_spline_point(mean_points)
         
         spl_x,_ = interpolate.splev(min_u, self.median_tck)
         
@@ -1293,8 +1321,8 @@ class Curvilinear_Homography():
         template_im_height = torch.sum(torch.sqrt(torch.pow((template_top - template_bottom),2)),dim = 1)
         template_ratio = template_im_height / template_space_heights
         
-        box_top    = torch.mean(boxes[:,4:8,:],dim = 1)
-        box_bottom = torch.mean(boxes[:,0:4,:],dim = 1)
+        box_top    = torch.mean(boxes[:,4:8,:2],dim = 1)
+        box_bottom = torch.mean(boxes[:,0:4,:2],dim = 1)
         box_height = torch.sum(torch.sqrt(torch.pow((box_top - box_bottom),2)),dim = 1)
         
         height = box_height / template_ratio
@@ -1420,8 +1448,8 @@ class Curvilinear_Homography():
         
         ### Project each aerial imagery point into pixel space and get pixel error
         if True:
-            print("Test 1: Pixel Reprojection Error\n")
-            
+            print("Test 1: Pixel Reprojection Error")
+            start = time.time()
             running_error = []
             for name in self.correspondence.keys():
                 corr = self.correspondence[name]
@@ -1435,14 +1463,16 @@ class Curvilinear_Homography():
                 
                 proj_space_pts = self.space_to_im(space_pts,name = namel).squeeze(1)
                 error = torch.sqrt(((proj_space_pts - im_pts)**2).sum(dim = 1)).mean()
-                print("Mean error for {}: {}px".format(name,error))
+                #print("Mean error for {}: {}px".format(name,error))
                 running_error.append(error)   
-            print("Average Pixel Reprojection Error across all homographies: {}px".format(sum(running_error)/len(running_error)))
+            end = time.time() - start
+            print("Average Pixel Reprojection Error across all homographies: {}px in {} sec\n".format(sum(running_error)/len(running_error),end))
+            
             
         
         ### Project each camera point into state plane coordinates and get ft error
         if True:
-            print("Test 2: State Reprojection Error\n")
+            print("Test 2: State Reprojection Error")
             running_error = []
             
             all_im_pts = []
@@ -1464,9 +1494,9 @@ class Curvilinear_Homography():
                 proj_im_pts = self.im_to_space(im_pts,name = namel, heights = 0, refine_heights = False).squeeze(1)
                 
                 error = torch.sqrt(((proj_im_pts - space_pts)**2).sum(dim = 1)).mean()
-                print("Mean error for {}: {}ft".format(name,error))
+                #print("Mean error for {}: {}ft".format(name,error))
                 running_error.append(error)
-            print("Average Space Reprojection Error across all homographies: {}ft".format(sum(running_error)/len(running_error)))
+            print("Average Space Reprojection Error across all homographies: {}ft\n".format(sum(running_error)/len(running_error)))
         
         if True:
             ### Create a random set of boxes
@@ -1484,10 +1514,10 @@ class Curvilinear_Homography():
             
             error = torch.abs(repro_state_boxes - boxes)
             mean_error = error.mean(dim = 0)
-            print("Mean State-Space-State Error: {}ft".format(mean_error))
+            print("Mean State-Space-State Error: {}ft\n".format(mean_error))
         
         if True:
-            print("Test 3: Random Box Reprojection Error (State-Im-State) \n")
+            print("Test 3: Random Box Reprojection Error (State-Im-State)")
             
             all_im_pts = torch.cat(all_im_pts,dim = 0)
             state_pts = self.im_to_state(all_im_pts, name = all_cam_names, heights = 0,refine_heights = False)
@@ -1512,15 +1542,24 @@ class Curvilinear_Homography():
             
             error = torch.abs(repro_state_boxes - boxes)
             error = torch.mean(error,dim = 0)
-            print("Average State-Im_State Reprojection Error: {} ft".format(error))
+            print("Average State-Im_State Reprojection Error: {} ft\n".format(error))
         
+        
+        if True:
+            print("Test 3: Random Box Reprojection Error (Im-State-Im)")
+
+            repro_im_boxes = self.state_to_im(repro_state_boxes, name = all_cam_names)
+            
+            error = torch.abs(repro_im_boxes-im_boxes)
+            error = torch.mean(error)
+            print("Average Im-State-Im Reprojection Error: {} px\n".format(error))
         
 #%% MAIN        
     
 if __name__ == "__main__":
     im_dir = "/home/derek/Documents/i24/i24_homography/data_real"
     space_dir = "/home/derek/Documents/i24/i24_homography/aerial/to_P24"
-    save_file = "new_hg_save.cpkl"
+    save_file =  "new_hg_save.cpkl"
 
     hg = Curvilinear_Homography(save_file = save_file,space_dir = space_dir, im_dir = im_dir)
     hg.test_transformation()
