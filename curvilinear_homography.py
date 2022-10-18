@@ -902,8 +902,48 @@ class Curvilinear_Homography():
     def _fit_MM_offset(self):
         return 0
     
-    def _generate_extents_file(self):
-        pass
+    def _generate_extents_file(self,im_dir,output_path = "cam_extents.config"):
+        """
+        Produce a text file as utilized by tracking with name=xmin,xmax,ymin,ymax for each camera
+        im_dir         - str - path to directory with cpkl files of attributes labeled in image coordinates
+        output_path    - str - desired output .config file, defaulting to current directory
+        RETURN:     None
+        
+        """
+        
+        # 1. load all extent image points into a dictionary per side
+        # 2. convert all extent points into state coordinates
+        # 3. Find min enclosing extents for each camera
+        # 4. Look for gaps
+        # 5. write extents to output file
+        
+        data = {"EB":{},"WB":{}}
+        
+        # 1. load all extent image points into a dictionary per side
+
+        # get all cameras
+        cam_data_paths = glob.glob(os.path.join(im_dir,"*.cpkl"))
+        
+        for cam_data_path in cam_data_paths:
+            # specify path to camera imagery file
+            #cam_im_path   = cam_data_path.split(".cpkl")[0] + ".png"
+            camera = cam_data_path.split(".cpkl")[0].split("/")[-1]
+            
+            # load all points
+            with open(cam_data_path, "rb") as f:
+                im_data = pickle.load(f)
+                
+            for direction in ["EB","WB"]:
+                fov_data = im_data[direction]["FOV"]
+                fov_data = torch.stack(torch.tensor([item[0],item[1]]) for item in fov_data)
+                 
+                if len(fov_data) > 0:
+                    data[camera + "_" + direction] = fov_data
+                
+                
+        # 2. convert all extent points into state coordinates
+        
+        
     
     def _generate_mask_images(self):
         pass
@@ -1563,3 +1603,5 @@ if __name__ == "__main__":
 
     hg = Curvilinear_Homography(save_file = save_file,space_dir = space_dir, im_dir = im_dir)
     hg.test_transformation()
+    
+    hg._generate_extents_file(im_dir)
