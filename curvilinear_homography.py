@@ -101,7 +101,7 @@ class Curvilinear_Homography():
         # intialize correspondence
         
         self.correspondence = {}
-        if save_file is not None:
+        if save_file is not None and os.path.exists(save_file):
             with open(save_file,"rb") as f:
                 # everything in correspondence is pickleable without object definitions to allow compatibility after class definitions change
                 self.correspondence,self.median_tck,self.median_u,self.guess_tck = pickle.load(f)
@@ -895,7 +895,7 @@ class Curvilinear_Homography():
             
             #print("Max step: {}".format(max_change))
          
-        print("Newton method took {}s for {} points".format(time.time() - start,points.shape[0]))
+        #print("Newton method took {}s for {} points".format(time.time() - start,points.shape[0]))
         return guess_u
             
     
@@ -917,7 +917,7 @@ class Curvilinear_Homography():
         # 4. Look for gaps
         # 5. write extents to output file
         
-        data = {"EB":{},"WB":{}}
+        data = {}
         
         # 1. load all extent image points into a dictionary per side
 
@@ -935,18 +935,99 @@ class Curvilinear_Homography():
                 
             for direction in ["EB","WB"]:
                 fov_data = im_data[direction]["FOV"]
-                fov_data = torch.stack(torch.tensor([item[0],item[1]]) for item in fov_data)
-                 
+                
+                
+                
                 if len(fov_data) > 0:
+                    fov_data = torch.stack([torch.tensor([item[0],item[1]]) for item in fov_data])
                     data[camera + "_" + direction] = fov_data
                 
                 
         # 2. convert all extent points into state coordinates
+        for key in data.keys():
+            if key not in self.correspondence.keys():
+                continue
+            key_data = data[key]
+            name = [key.split("_")[0] for _ in key_data]
+            data[key] = self.im_to_state(key_data.float().unsqueeze(1),name = name, heights = 0, refine_heights = False)
+            
+        # 3. Find min enclosing extents for each camera
+        extents = {}
+        for key in data.keys():
+            key_data = data[key]
+            minx = torch.min(key_data[:,0]).item()
+            maxx = torch.max(key_data[:,0]).item()
+            miny = torch.min(key_data[:,1]).item()
+            maxy = torch.max(key_data[:,1]).item()
+            
+            extents[key] = [minx,maxx,miny,maxy]
         
         
-    
-    def _generate_mask_images(self):
-        pass
+           
+        # 4. Look for gaps
+         
+        if False:
+            minx_total = min([extents[key][0] for key in extents.keys()])
+            maxx_total = max([extents[key][1] for key in extents.keys()])
+            miny_total = min([extents[key][2] for key in extents.keys()])
+            maxy_total = max([extents[key][3] for key in extents.keys()])
+            extents_im = np.zeros([int(maxx_total - minx_total),int(maxy_total - miny_total)]).astype(np.uint8)
+            for cam_fov in extents.values():
+                cv2.rectangle(extents_im,(int(cam_fov[0]),int(cam_fov[1])),(int(cam_fov[2]),int(cam_fov[3])),(255,255,0),-1)
+                
+            scale = extents_im.shape[0]/2000
+            res = (int(extents_im.shape[0]//scale), int(extents_im.shape[1]//scale))
+            extents_im = cv2.resize(extents_im,res)
+            cv2.imshow("Extents",extents_im)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        
+        # 5. write extents to output file
+        keys = list(extents.keys())
+        keys.sort()
+        with open(output_path,"w",encoding='utf-8') as f:
+            for key in keys:
+                key_data = extents[key]
+                line = "{}={},{},{},{}\n".format(key,int(key_data[0]),int(key_data[1]),int(key_data[2]),int(key_data[3]))
+                f.write(line)
+
+    def _generate_mask_images(self,im_dir,mask_save_dir = "mask"):
+        cam_data_paths = glob.glob(os.path.join(im_dir,"*.cpkl"))
+        for cam_data_path in cam_data_paths:
+            # specify path to camera imagery file
+            #cam_im_path   = cam_data_path.split(".cpkl")[0] + ".png"
+            camera = cam_data_path.split(".cpkl")[0].split("/")[-1]
+            
+            # load all points
+            with open(cam_data_path, "rb") as f:
+                im_data = pickle.load(f)
+                
+            for direction in ["EB","WB"]:
+                try:
+                    mask = im_data[direction]["mask"]
+                    
+                    
+                    
+                    if len(mask) == 0:
+                        continue
+                    
+                    mask_im = np.zeros([2160,3840])
+                    
+                    mask_poly = np.array([pt for pt in mask]).reshape(
+                        1, -1, 2).astype(np.int32)
+                    mask_im= cv2.fillPoly(
+                        mask_im, mask_poly,  255, lineType=cv2.LINE_AA)
+                    
+                    save_name = os.path.join(mask_save_dir,"{}_mask.png".format(camera))
+                    cv2.imwrite(save_name,mask_im)
+                    
+                    mask_im = cv2.resize(mask_im,(1920,1090))
+                    save_name2 = os.path.join(mask_save_dir,"{}_mask_1080.png".format(camera))
+                    cv2.imwrite(save_name2,mask_im)
+                    
+                except:
+                    pass
+        
     
 
     
@@ -1108,7 +1189,7 @@ class Curvilinear_Homography():
         boxes  = self._sp_im(points,name = name)      
         return boxes
         
-    def im_to_state(self,points, name = None, heights = None,refine_heights = True):
+    def im_to_state(self,points, name = None, heights = None,refine_heights = True,classes = None):
         """
         Converts image boxes to roadway coordinate boxes
         points    - [d,m,2] array of points in image
@@ -1116,7 +1197,7 @@ class Curvilinear_Homography():
         heights   - [d] tensor of object heights
         RETURN:     [d,s] array of boxes in state space where s is state size (probably 6)
         """
-        space_pts = self.im_to_space(points,name = name, heights = heights,refine_heights = refine_heights)
+        space_pts = self.im_to_space(points,name = name, classes = classes, heights = heights,refine_heights = refine_heights)
         return self.space_to_state(space_pts)
     
     def state_to_im(self,points,name = None):
@@ -1279,7 +1360,7 @@ class Curvilinear_Homography():
         
         
         #test
-        test_direction = self.get_direction(new_pts)[1]
+        #test_direction = self.get_direction(new_pts)[1]
         
         return new_pts
     
@@ -1373,7 +1454,7 @@ class Curvilinear_Homography():
     
     #%% Plotting Functions
     
-    def plot_boxes(self,im,boxes,color = (255,255,255),labels = None,thickness = 1):
+    def plot_boxes(self,im,boxes,color = (255,255,255),labels = None,thickness = 1, ORIGIN = True):
         """
         As one might expect, plots 3D boxes on input image
         
@@ -1382,24 +1463,24 @@ class Curvilinear_Homography():
         color - 3-tuple specifying box color to plot
         """
                 
-        DRAW = [[0,1,1,0,1,0,0,0], #bfl
-                [0,0,0,1,0,1,0,0], #bfr
-                [0,0,0,1,0,0,1,1], #bbl
-                [0,0,0,0,0,0,1,1], #bbr
-                [0,0,0,0,0,1,1,0], #tfl
-                [0,0,0,0,0,0,0,1], #tfr
-                [0,0,0,0,0,0,0,1], #tbl
-                [0,0,0,0,0,0,0,0]] #tbr
+        DRAW = [[0,1,2,0,1,0,0,0], #bfr
+                [0,0,0,1,0,1,0,0], #bfl
+                [0,0,0,3,0,0,4,1], #bbr
+                [0,0,0,0,0,0,1,1], #bbl
+                [0,0,0,0,0,1,1,0], #tfr
+                [0,0,0,0,0,0,0,1], #tfl
+                [0,0,0,0,0,0,0,1], #tbr
+                [0,0,0,0,0,0,0,0]] #tbl
         
-        DRAW_BASE = [[0,1,1,1], #bfl
-                     [0,0,1,1], #bfr
-                     [0,0,0,1], #bbl
-                     [0,0,0,0]] #bbr
+        DRAW_BASE = [[0,1,1,1], #bfr
+                     [0,0,1,1], #bfl
+                     [0,0,0,1], #bbr
+                     [0,0,0,0]] #bbl
         
         for idx, bbox_3d in enumerate(boxes):
             
             # check whether box mostly falls within frame
-            if torch.min(bbox_3d[:,:,0]) < -100 or torch.max(bbox_3d[:,:,0]) > 3940 or torch.min(bbox_3d[:,:,1]) < -100 or torch.max(bbox_3d[:,:,1]) > 2260:
+            if torch.min(bbox_3d[:,0]) < -100 or torch.max(bbox_3d[:,0]) > 3940 or torch.min(bbox_3d[:,1]) < -100 or torch.max(bbox_3d[:,1]) > 2260:
                 continue
             
             if type(color) == np.ndarray:
@@ -1414,10 +1495,13 @@ class Curvilinear_Homography():
                 for b in range(a,len(bbox_3d)):
                     bb = bbox_3d[b]
                     if DRAW[a][b] == 1:
-                        #try:
                             im = cv2.line(im,(int(ab[0]),int(ab[1])),(int(bb[0]),int(bb[1])),c,thickness)
-                        #except:
-                            pass
+                    elif DRAW[a][b] == 2:
+                            im = cv2.line(im,(int(ab[0]),int(ab[1])),(int(bb[0]),int(bb[1])),(0,255,0),thickness)
+                    elif DRAW[a][b] == 3:
+                            im = cv2.line(im,(int(ab[0]),int(ab[1])),(int(bb[0]),int(bb[1])),(255,0,0),thickness)
+                    elif DRAW[a][b] == 4:
+                            im = cv2.line(im,(int(ab[0]),int(ab[1])),(int(bb[0]),int(bb[1])),(0,0,255),thickness)
         
             if labels is not None:
                 label = labels[idx]
@@ -1425,6 +1509,12 @@ class Curvilinear_Homography():
                 top   = bbox_3d[0,1]
                 im    = cv2.putText(im,"{}".format(label),(int(left),int(top - 10)),cv2.FONT_HERSHEY_PLAIN,2,(0,0,0),3)
                 im    = cv2.putText(im,"{}".format(label),(int(left),int(top - 10)),cv2.FONT_HERSHEY_PLAIN,2,(255,255,255),1)
+            
+            # draw origin
+            if ORIGIN:
+                bbl = bbox_3d[2,:]
+                bbl = int(bbl[0]),int(bbl[1])
+                im = cv2.circle(im,bbl,2,(255,255,255),-1)
             
         return im
         
@@ -1440,8 +1530,9 @@ class Curvilinear_Homography():
         Lazily, duplicate each point 8 times as a box with 0 l,w,h then call plot_boxes
         points -  [d,2] array of x,y points in roadway coordinates / state 
         """
-        rep_points = torch.cat(points,torch.zeros(points.shape[0],3),dim = 1)
+        rep_points = torch.cat((points,torch.zeros([points.shape[0],3]),torch.ones([points.shape[0],1])),dim = 1)
         space_points = self.state_to_space(rep_points)
+        space_points = space_points[:,0,:]
         self.plot_space_points(im,space_points,color = color)
     
     def plot_space_points(self,im,points,color = (255,0,0), name = None):
@@ -1449,7 +1540,7 @@ class Curvilinear_Homography():
         points -  [d,n,3] array of x,y points in roadway coordinates / state 
         """
         
-        im_pts = self.space_to_im(points, name = name)
+        im_pts = self.space_to_im(points, name = name).squeeze(1)
         
         for point in im_pts:
             cv2.circle(im,(int(point[0]),int(point[1])),2,color,-1)
@@ -1472,7 +1563,7 @@ class Curvilinear_Homography():
     
     #%% Testing Functions
     
-    def test_transformation(self):
+    def test_transformation(self,im_dir):
         """
         A series of tests will be run
         
@@ -1565,16 +1656,17 @@ class Curvilinear_Homography():
             ### Create a random set of boxes
             boxes = torch.rand(state_pts.shape[0],6) 
             boxes[:,:2] = state_pts[:,:2]
-            #boxes[:,1] = boxes[:,1] * 240 - 120
-            boxes[:,2] *= 60
-            boxes[:,3] *= 10
-            boxes[:,4] *= 10
+            boxes[:,1] = 0 #boxes[:,1] * 240 - 120
+            boxes[:,2] *= 0
+            boxes[:,3] *= 0
+            boxes[:,4] *= 0
             boxes[:,5] = torch.sign(boxes[:,1])
             
             # get appropriate camera for each object
             
             
             im_boxes = self.state_to_im(boxes,name = all_cam_names)
+            directions = boxes[:,5]
             
             # plot some of the boxes
             repro_state_boxes = self.im_to_state(im_boxes,name = all_cam_names,heights = boxes[:,4],refine_heights = True)

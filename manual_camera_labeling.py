@@ -893,6 +893,7 @@ class CameraAnnotator:
         self.z_cache = None
         self.ACTIVE = "POINTS"
         self.save()
+        self.SHOW_VP = True
         
     def get_vp(self):
         
@@ -1189,7 +1190,7 @@ if __name__ == "__main__":
         sequence
     except:
         print("No camera name given. Using default Instead"        )
-        camera_name = "P24C06"
+        camera_name = "P48C06"
         files = os.listdir(base_dir)
         for file in files:
             #print(file)
